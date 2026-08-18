@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 import socket
 import ipaddress
@@ -21,15 +22,19 @@ DATA_DIR = "/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 jobs = {}
-MAX_REDIRECTS = 5
 
+# 0 = unlimited
+MAX_DOWNLOAD_MBPS = float(
+    os.environ.get("MAX_DOWNLOAD_MBPS", "0")
+)
 
 HTML = """
 <!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport"
+      content="width=device-width,initial-scale=1">
 
 <title>Cloud Mirror Dashboard</title>
 
@@ -40,14 +45,14 @@ HTML = """
 
 body {
     margin: 0;
-    padding: 30px 15px;
-    font-family: Arial, sans-serif;
+    padding: 25px 15px;
+    font-family: Arial,sans-serif;
     background: #0f172a;
     color: #e5e7eb;
 }
 
 .container {
-    max-width: 760px;
+    max-width: 780px;
     margin: auto;
 }
 
@@ -55,7 +60,7 @@ body {
     background: #1e293b;
     padding: 25px;
     border-radius: 16px;
-    box-shadow: 0 10px 40px rgba(0,0,0,.3);
+    box-shadow: 0 10px 40px #0005;
 }
 
 h1 {
@@ -66,7 +71,7 @@ input {
     width: 100%;
     padding: 14px;
     margin: 10px 0;
-    border-radius: 10px;
+    border-radius: 9px;
     border: 1px solid #475569;
     background: #0f172a;
     color: white;
@@ -76,7 +81,7 @@ button {
     width: 100%;
     padding: 14px;
     border: 0;
-    border-radius: 10px;
+    border-radius: 9px;
     cursor: pointer;
     font-weight: bold;
     background: #2563eb;
@@ -89,10 +94,50 @@ button:hover {
 
 .box {
     margin-top: 20px;
-    padding: 15px;
+    padding: 18px;
     background: #0f172a;
     border-radius: 10px;
     word-break: break-all;
+}
+
+.progress {
+    width: 100%;
+    height: 22px;
+    background: #334155;
+    border-radius: 20px;
+    overflow: hidden;
+    margin: 15px 0;
+}
+
+.bar {
+    height: 100%;
+    width: 0%;
+    background: #22c55e;
+    transition: width .3s;
+}
+
+.stats {
+    display: grid;
+    grid-template-columns: repeat(2,1fr);
+    gap: 10px;
+    margin-top: 15px;
+}
+
+.stat {
+    background: #1e293b;
+    padding: 12px;
+    border-radius: 8px;
+}
+
+.label {
+    color: #94a3b8;
+    font-size: 12px;
+}
+
+.value {
+    font-size: 17px;
+    font-weight: bold;
+    margin-top: 4px;
 }
 
 a {
@@ -109,23 +154,21 @@ a {
 <body>
 
 <div class="container">
-
 <div class="card">
 
 <h1>🚀 Cloud File Mirror</h1>
 
 <p class="small">
-Paste a direct URL to a file you are authorized to mirror.
+Remote URL → Mirror → Direct Download
 </p>
 
 <form method="POST" action="/mirror">
 
 <input
-    name="url"
-    type="url"
-    placeholder="https://example.com/file.zip"
-    required
->
+ name="url"
+ type="url"
+ placeholder="https://example.com/file.zip"
+ required>
 
 <button type="submit">
 Create Mirror
@@ -133,14 +176,7 @@ Create Mirror
 
 </form>
 
-{% if result %}
-<div class="box">
-{{ result|safe }}
 </div>
-{% endif %}
-
-</div>
-
 </div>
 
 </body>
@@ -148,25 +184,21 @@ Create Mirror
 """
 
 
-def is_public_hostname(hostname):
-    """
-    Prevent requests to localhost, private networks,
-    loopback, link-local and cloud metadata addresses.
-    """
+def public_host(hostname):
 
     if not hostname:
         return False
 
     hostname = hostname.lower().rstrip(".")
 
-    blocked_names = {
+    blocked = {
         "localhost",
         "localhost.localdomain",
         "metadata.google.internal",
         "instance-data",
     }
 
-    if hostname in blocked_names:
+    if hostname in blocked:
         return False
 
     try:
@@ -180,6 +212,7 @@ def is_public_hostname(hostname):
         return False
 
     for item in addresses:
+
         ip = ipaddress.ip_address(item[4][0])
 
         if (
@@ -196,31 +229,36 @@ def is_public_hostname(hostname):
 
 
 def validate_url(url):
+
     try:
+
         parsed = urlparse(url)
 
-        if parsed.scheme not in ("http", "https"):
+        if parsed.scheme not in (
+            "http",
+            "https"
+        ):
             return False, "Only HTTP/HTTPS URLs are allowed."
 
-        if not parsed.hostname:
-            return False, "Invalid hostname."
-
-        if not is_public_hostname(parsed.hostname):
-            return False, "Private/internal destinations are blocked."
+        if not public_host(parsed.hostname):
+            return False, "Private/internal URL blocked."
 
         return True, ""
 
     except Exception:
+
         return False, "Invalid URL."
 
 
-def get_filename(url, response, job_id):
-    name = os.path.basename(urlparse(url).path)
+def filename_from_url(url, job_id):
 
-    if not name or name in (".", ".."):
+    name = os.path.basename(
+        urlparse(url).path
+    )
+
+    if not name:
         name = f"download-{job_id}.bin"
 
-    # Remove unsafe characters
     safe = "".join(
         c for c in name
         if c.isalnum() or c in "._-"
@@ -236,21 +274,21 @@ def download_file(job_id, url):
 
     try:
 
-        jobs[job_id] = {
-            "status": "connecting",
-            "progress": 0,
-            "downloaded": 0,
-            "total": 0,
-        }
-
         valid, error = validate_url(url)
 
         if not valid:
             raise Exception(error)
 
-        session = requests.Session()
+        jobs[job_id] = {
+            "status": "connecting",
+            "progress": 0,
+            "downloaded": 0,
+            "total": 0,
+            "speed": 0,
+            "eta": 0,
+        }
 
-        response = session.get(
+        response = requests.get(
             url,
             stream=True,
             timeout=(20, 60),
@@ -262,37 +300,41 @@ def download_file(job_id, url):
 
         response.raise_for_status()
 
-        # Validate final redirected destination
-        final_url = response.url
-
-        valid, error = validate_url(final_url)
+        # Validate final redirect
+        valid, error = validate_url(
+            response.url
+        )
 
         if not valid:
             raise Exception(
-                "Redirected to a private/internal destination."
+                "Redirect destination blocked."
             )
 
         total = int(
-            response.headers.get("Content-Length", 0)
+            response.headers.get(
+                "Content-Length",
+                0
+            )
         )
 
-        filename = get_filename(
-            final_url,
-            response,
+        filename = filename_from_url(
+            response.url,
             job_id
         )
 
-        final_path = os.path.join(
+        path = os.path.join(
             DATA_DIR,
             f"{job_id}-{filename}"
         )
 
         downloaded = 0
+        started = time.monotonic()
+        last_update = started
 
         jobs[job_id]["status"] = "downloading"
         jobs[job_id]["total"] = total
 
-        with open(final_path, "wb") as file:
+        with open(path, "wb") as file:
 
             for chunk in response.iter_content(
                 chunk_size=1024 * 1024
@@ -301,25 +343,79 @@ def download_file(job_id, url):
                 if not chunk:
                     continue
 
+                # Optional speed limiter
+                if MAX_DOWNLOAD_MBPS > 0:
+
+                    target_seconds = (
+                        (len(chunk) / 1024 / 1024)
+                        / MAX_DOWNLOAD_MBPS
+                    )
+
+                    elapsed_chunk = 0
+
+                    if target_seconds > elapsed_chunk:
+                        time.sleep(
+                            target_seconds
+                            - elapsed_chunk
+                        )
+
                 file.write(chunk)
 
                 downloaded += len(chunk)
 
-                progress = (
-                    int(downloaded * 100 / total)
-                    if total > 0
-                    else 0
+                now = time.monotonic()
+
+                elapsed = max(
+                    now - started,
+                    0.001
                 )
 
-                jobs[job_id].update({
-                    "progress": progress,
-                    "downloaded": downloaded,
-                })
+                speed = downloaded / elapsed
+
+                if total > 0:
+
+                    progress = (
+                        downloaded * 100 / total
+                    )
+
+                    eta = (
+                        (total - downloaded)
+                        / speed
+                        if speed > 0
+                        else 0
+                    )
+
+                else:
+
+                    progress = 0
+                    eta = 0
+
+                # Update roughly every 0.2 sec
+                if now - last_update >= 0.2:
+
+                    jobs[job_id].update({
+                        "progress": round(
+                            progress, 2
+                        ),
+                        "downloaded": downloaded,
+                        "total": total,
+                        "speed": speed,
+                        "eta": eta,
+                    })
+
+                    last_update = now
 
         jobs[job_id].update({
             "status": "completed",
             "progress": 100,
-            "filename": os.path.basename(final_path),
+            "downloaded": downloaded,
+            "total": total,
+            "speed": downloaded / max(
+                time.monotonic() - started,
+                0.001
+            ),
+            "eta": 0,
+            "filename": os.path.basename(path),
         })
 
     except Exception as exc:
@@ -334,24 +430,26 @@ def download_file(job_id, url):
 def dashboard():
 
     return render_template_string(
-        HTML,
-        result=None
+        HTML
     )
 
 
 @app.route("/mirror", methods=["POST"])
-def create_mirror():
+def mirror():
 
-    url = request.form.get("url", "").strip()
+    url = request.form.get(
+        "url",
+        ""
+    ).strip()
 
     valid, error = validate_url(url)
 
     if not valid:
-
-        return render_template_string(
-            HTML,
-            result=f"<b>Error:</b> {error}"
-        ), 400
+        return f"""
+        <h2>❌ Invalid URL</h2>
+        <p>{error}</p>
+        <a href="/">Back</a>
+        """, 400
 
     job_id = uuid.uuid4().hex[:12]
 
@@ -360,13 +458,11 @@ def create_mirror():
         "progress": 0,
     }
 
-    thread = threading.Thread(
+    threading.Thread(
         target=download_file,
         args=(job_id, url),
         daemon=True,
-    )
-
-    thread.start()
+    ).start()
 
     return redirect(
         f"/status/{job_id}"
@@ -376,95 +472,257 @@ def create_mirror():
 @app.route("/status/<job_id>")
 def status(job_id):
 
-    job = jobs.get(job_id)
-
-    if not job:
+    if job_id not in jobs:
         return "Job not found", 404
 
-    status_value = job.get("status")
+    return """
+<!doctype html>
+<html>
+<head>
 
-    if status_value != "completed":
+<meta charset="utf-8">
+<meta name="viewport"
+      content="width=device-width,initial-scale=1">
 
-        if status_value == "error":
+<title>Mirror Status</title>
 
-            return f"""
-            <h2>❌ Download Failed</h2>
-            <p>{job.get("error", "Unknown error")}</p>
-            <p><a href="/">Back</a></p>
-            """
+<style>
+body {
+    font-family: Arial;
+    background: #0f172a;
+    color: white;
+    padding: 25px;
+}
 
-        progress = job.get("progress", 0)
+.box {
+    max-width: 750px;
+    margin: auto;
+    background: #1e293b;
+    padding: 25px;
+    border-radius: 15px;
+}
 
-        return f"""
-        <!doctype html>
-        <html>
-        <head>
-        <meta http-equiv="refresh" content="3">
-        </head>
-        <body style="font-family:Arial;padding:40px">
+.progress {
+    height: 24px;
+    background: #334155;
+    border-radius: 20px;
+    overflow: hidden;
+}
 
-        <h2>⏳ Downloading...</h2>
+.bar {
+    height: 100%;
+    background: #22c55e;
+    width: 0%;
+}
 
-        <p>Status: {status_value}</p>
+.stats {
+    display: grid;
+    grid-template-columns: repeat(2,1fr);
+    gap: 10px;
+    margin-top: 15px;
+}
 
-        <p>Progress: {progress}%</p>
+.stat {
+    background: #0f172a;
+    padding: 15px;
+    border-radius: 8px;
+}
 
-        <progress value="{progress}" max="100"
-                  style="width:100%;height:25px">
-        </progress>
+a {
+    color: #60a5fa;
+}
+</style>
 
-        <p>
-        Downloaded:
-        {job.get("downloaded", 0) // 1024 // 1024} MB
-        </p>
+</head>
 
-        </body>
-        </html>
-        """
+<body>
 
-    filename = job["filename"]
+<div class="box">
 
-    # Public mirror URL
-    mirror_url = (
-        request.host_url.rstrip("/")
-        + "/files/"
-        + filename
-    )
+<h2 id="title">
+⏳ Preparing mirror...
+</h2>
 
-    return f"""
-    <!doctype html>
-    <html>
-    <body style="font-family:Arial;padding:40px">
+<div class="progress">
+<div class="bar" id="bar"></div>
+</div>
 
-    <h2>✅ Mirror Ready</h2>
+<div class="stats">
 
-    <p>
-    <b>File:</b> {filename}
-    </p>
+<div class="stat">
+<div>Progress</div>
+<strong id="progress">0%</strong>
+</div>
 
-    <p>
-    <a href="{mirror_url}">
-    Download File
-    </a>
-    </p>
+<div class="stat">
+<div>Speed</div>
+<strong id="speed">0 MB/s</strong>
+</div>
 
-    <p>
-    Mirror URL:
-    </p>
+<div class="stat">
+<div>Downloaded</div>
+<strong id="downloaded">0 MB</strong>
+</div>
 
-    <input
-        value="{mirror_url}"
-        readonly
-        style="width:100%;padding:12px"
-    >
+<div class="stat">
+<div>Total</div>
+<strong id="total">Unknown</strong>
+</div>
 
-    <br><br>
+<div class="stat">
+<div>ETA</div>
+<strong id="eta">--</strong>
+</div>
 
-    <a href="/">Create another mirror</a>
+</div>
 
-    </body>
-    </html>
-    """
+<div id="result"></div>
+
+</div>
+
+<script>
+
+const jobId = location.pathname.split("/").pop();
+
+function mb(bytes) {
+    return (bytes / 1024 / 1024).toFixed(2);
+}
+
+function formatETA(seconds) {
+
+    if (!seconds || seconds <= 0)
+        return "--";
+
+    seconds = Math.round(seconds);
+
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor(
+        (seconds % 3600) / 60
+    );
+    const s = seconds % 60;
+
+    if (h > 0)
+        return `${h}h ${m}m ${s}s`;
+
+    if (m > 0)
+        return `${m}m ${s}s`;
+
+    return `${s}s`;
+}
+
+async function update() {
+
+    try {
+
+        const response =
+            await fetch(
+                `/api/status/${jobId}`
+            );
+
+        const data =
+            await response.json();
+
+        if (data.status === "error") {
+
+            document.getElementById(
+                "title"
+            ).innerText =
+                "❌ Download Failed";
+
+            document.getElementById(
+                "result"
+            ).innerText =
+                data.error || "Unknown error";
+
+            return;
+        }
+
+        document.getElementById(
+            "progress"
+        ).innerText =
+            `${data.progress || 0}%`;
+
+        document.getElementById(
+            "bar"
+        ).style.width =
+            `${data.progress || 0}%`;
+
+        document.getElementById(
+            "speed"
+        ).innerText =
+            `${mb(data.speed || 0)} MB/s`;
+
+        document.getElementById(
+            "downloaded"
+        ).innerText =
+            `${mb(data.downloaded || 0)} MB`;
+
+        document.getElementById(
+            "total"
+        ).innerText =
+            data.total
+                ? `${mb(data.total)} MB`
+                : "Unknown";
+
+        document.getElementById(
+            "eta"
+        ).innerText =
+            formatETA(data.eta);
+
+        if (data.status === "completed") {
+
+            document.getElementById(
+                "title"
+            ).innerText =
+                "✅ Mirror Ready";
+
+            const url =
+                `${location.origin}/files/${encodeURIComponent(data.filename)}`;
+
+            document.getElementById(
+                "result"
+            ).innerHTML = `
+                <br>
+                <p>
+                    <a href="${url}">
+                        ⬇️ Download File
+                    </a>
+                </p>
+
+                <input
+                    value="${url}"
+                    readonly
+                    style="
+                    width:100%;
+                    padding:12px;
+                    box-sizing:border-box;
+                    "
+                >
+            `;
+
+            return;
+        }
+
+        document.getElementById(
+            "title"
+        ).innerText =
+            "⏳ Downloading...";
+
+        setTimeout(update, 1000);
+
+    } catch (e) {
+
+        setTimeout(update, 2000);
+    }
+}
+
+update();
+
+</script>
+
+</body>
+</html>
+"""
 
 
 @app.route("/api/status/<job_id>")
@@ -493,11 +751,13 @@ def files(filename):
 if __name__ == "__main__":
 
     port = int(
-        os.environ.get("PORT", "8080")
+        os.environ.get(
+            "PORT",
+            "8080"
+        )
     )
 
     app.run(
         host="0.0.0.0",
-        port=port,
-        threaded=True
-        )
+        port=port
+    )
